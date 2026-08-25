@@ -54,7 +54,9 @@
       pkgs = import nixpkgs {inherit system;};
       lib = pkgs.lib;
 
-      version = "0.1.7";
+      # Single source of the plugin version — bumped on release + matched by a
+      # `vX.Y.Z` git tag. Stamped into the binary via ldflags (-X main.pluginVersion).
+      version = lib.fileContents ./VERSION;
 
       # `doCheck = false`: lab-only build; upstream tests add build time without
       # catching anything the rke2lab use case cares about.

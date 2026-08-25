@@ -1,4 +1,4 @@
-module github.com/nxmatic/rke2lab/containerd-shim-flox-wrapper
+module github.com/seedmatic/flox-nri-plugin
 
 go 1.25
 

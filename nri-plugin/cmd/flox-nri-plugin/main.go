@@ -8,7 +8,7 @@ import (
 	"syscall"
 
 	"github.com/containerd/nri/pkg/stub"
-	"github.com/nxmatic/rke2lab/containerd-shim-flox-wrapper/pkg/nri"
+	"github.com/seedmatic/flox-nri-plugin/pkg/nri"
 )
 
 const (
