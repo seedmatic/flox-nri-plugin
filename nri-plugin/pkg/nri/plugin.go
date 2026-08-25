@@ -202,14 +202,18 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	// container ns is unshared with rprivate propagation so host-side mounts
 	// don't reach the container.
 	//
-	// 1) nix-store overlay: read-only host store lower + writable ephemeral
-	//    tmpfs upper, so the container sees every host store path AND can author
-	//    its own (new flox envs, profiles, builds land in the upper).
-	nixStoreOverlayHook := &api.Hook{
+	// 1) nix overlay: read-only host /nix lower + writable ephemeral tmpfs upper.
+	//    ONE overlay over all of /nix gives the container a VALID store — the store
+	//    FILES and the registration DB (/nix/var/nix/db) that validates them — so
+	//    `flox activate` realises the baked activation as a cache-hit instead of
+	//    force-registering the closure (re-hashing go/delve/… → OOM on every start).
+	//    The overlay hook strips the host's stale daemon socket after mounting so
+	//    nix stays on the local store (no daemon in the container).
+	nixOverlayHook := &api.Hook{
 		Path: floxOverlayHookPath,
-		Args: []string{floxOverlayHookPath, "nix-store", "/nix/store", "/nix/store"},
+		Args: []string{floxOverlayHookPath, "nix", "/nix", "/nix"},
 	}
-	log.Printf("Adding CreateContainer hook (nix-store): %s /nix/store -> /nix/store", floxOverlayHookPath)
+	log.Printf("Adding CreateContainer hook (nix): %s /nix -> /nix", floxOverlayHookPath)
 
 	// 2) env-link: build the fine-grained .flox symlink farm — env/ symlinks
 	//    into the resolved store path (immutable default env), run/cache/log are
@@ -230,7 +234,7 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	log.Printf("Adding Prestart hook: %s %s %s %s", floxChownHookPath, uid, gid, homeDir)
 
 	adjustment.AddHooks(&api.Hooks{
-		CreateContainer: []*api.Hook{nixStoreOverlayHook, floxEnvLinkHook},
+		CreateContainer: []*api.Hook{nixOverlayHook, floxEnvLinkHook},
 		Prestart:        []*api.Hook{chownHook},
 	})
 
