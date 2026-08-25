@@ -1,0 +1,18 @@
+# Claude per-checkout local state (never committed)
+.claude/settings.local.json
+.claude/projects/
+
+# Nix
+result
+result-*
+
+# Go
+*.test
+*.out
+
+# sops filter is wired globally (core.attributesFile); keep a local .sops.yaml
+# to satisfy the smudge/clean filter, but this repo has no sops content to commit.
+.sops.yaml
+
+# Claude per-checkout tooling state (memory, sessions) — local only
+.claude/
