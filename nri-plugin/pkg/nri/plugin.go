@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -39,6 +40,13 @@ const (
 	// container `flox` invocation honors host policy (telemetry off, channel
 	// lock, ...) without each pod having to set FLOX_* env vars.
 	floxSystemConfigPath      = "/etc/flox.toml"
+	// The container's command is `flox activate …`, so flox must be on PATH BEFORE
+	// activation. flox is NOT in the injected env (that holds the workload's own
+	// packages) — it lives in the node's NixOS system profile. We resolve its
+	// /nix/store bin (visible in the container via the /nix/store overlay) and put
+	// it on PATH ourselves: the plugin already depends on flox, so it owns bringing
+	// it in (retires the flox-env `NIX_DEFAULT_PROFILE_BIN_STORE_PATH` ConfigMap key).
+	nixosSystemFloxBin = "/run/current-system/sw/bin/flox"
 	defaultDebugPort          = "2345"
 	defaultUID                = "0"
 	defaultGID                = "0"
@@ -241,9 +249,42 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		log.Printf("Bind-mounted host %s into container", floxSystemConfigPath)
 	}
 
+	// Put flox on the container PATH so `flox activate` (the container command)
+	// can find it. Prepend flox's store bin to any existing PATH; otherwise seed a
+	// sane default alongside it.
+	if floxBin, ferr := resolveFloxStoreBin(); ferr != nil {
+		log.Printf("WARNING: could not resolve flox store bin (%v) — container PATH not adjusted, `flox activate` may fail", ferr)
+	} else {
+		newPath := floxBin
+		if existing := getEnvVar(container, "PATH"); existing != "" {
+			newPath = floxBin + ":" + existing
+		} else {
+			newPath = floxBin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+		}
+		adjustment.AddEnv("PATH", newPath)
+		log.Printf("Injected flox onto container PATH: %s", floxBin)
+	}
+
 	log.Printf("Successfully configured Flox environment injection for container %s/%s", pod.GetNamespace(), container.GetName())
 
 	return adjustment, nil, nil
+}
+
+// resolveFloxStoreBin returns the /nix/store bin directory that holds the `flox`
+// binary. It resolves the node's NixOS system-profile symlink to its store path
+// (visible inside the container through the /nix/store overlay), falling back to a
+// PATH lookup. Returned as the directory so it can be prepended to $PATH.
+func resolveFloxStoreBin() (string, error) {
+	if resolved, err := filepath.EvalSymlinks(nixosSystemFloxBin); err == nil {
+		return filepath.Dir(resolved), nil
+	}
+	if p, err := exec.LookPath("flox"); err == nil {
+		if resolved, rerr := filepath.EvalSymlinks(p); rerr == nil {
+			return filepath.Dir(resolved), nil
+		}
+		return filepath.Dir(p), nil
+	}
+	return "", fmt.Errorf("flox not found at %s or on PATH", nixosSystemFloxBin)
 }
 
 // RemoveContainer is called when a container is removed
