@@ -96,11 +96,37 @@
           buildFlagsArray = ["-gcflags=all=-N -l"];
           ldflags = ["-X main.pluginVersion=${version}-debug"];
         });
+
+      # The OCI hooks the plugin references at fixed /usr/local/sbin paths. Owned
+      # here with the binary (the shim = binary + hooks + their contract); rke2lab
+      # only bakes this package onto the node via tmpfiles. Linux-only (util-linux
+      # is Linux-only, and the hooks run inside Linux containers): runc executes
+      # them with a minimal PATH, so the shebang is pinned to the store bash
+      # (patchShebangs) and the hooks' commands are wrapped onto PATH; the overlay
+      # hook also carries a STATIC `mount` (FLOX_NRI_MOUNT_BIN) for its pre-pivot
+      # chroot, since the target container image ships none.
+      flox-nri-hooks = pkgs.runCommandLocal "flox-nri-hooks" {
+        nativeBuildInputs = [pkgs.makeWrapper];
+      } ''
+        mkdir -p $out/sbin
+        install -m0755 ${./hooks/flox-nri-overlay-hook.sh}  $out/sbin/flox-nri-overlay-hook.sh
+        install -m0755 ${./hooks/flox-nri-env-link-hook.sh} $out/sbin/flox-nri-env-link-hook.sh
+        install -m0755 ${./hooks/flox-nri-chown-hook.sh}    $out/sbin/flox-nri-chown-hook.sh
+        patchShebangs $out/sbin
+        for f in $out/sbin/*.sh; do
+          wrapProgram "$f" \
+            --prefix PATH : ${lib.makeBinPath [pkgs.bash pkgs.coreutils pkgs.util-linux pkgs.gnused]} \
+            --set FLOX_NRI_MOUNT_BIN ${pkgs.pkgsStatic.util-linux}/bin/mount
+        done
+      '';
     in {
-      packages = {
-        inherit flox-nri-plugin flox-nri-plugin-debug;
-        default = flox-nri-plugin;
-      };
+      packages =
+        {
+          inherit flox-nri-plugin flox-nri-plugin-debug;
+          default = flox-nri-plugin;
+        }
+        # flox-nri-hooks is Linux-only (util-linux); don't expose it on darwin.
+        // lib.optionalAttrs pkgs.stdenv.isLinux {inherit flox-nri-hooks;};
 
       formatter = pkgs.alejandra;
     });
