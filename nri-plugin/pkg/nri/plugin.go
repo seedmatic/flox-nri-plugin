@@ -31,15 +31,15 @@ const (
 	// run/cache/log local). The container's /nix/store overlay lowers from the
 	// host store, so the same store path resolves inside the container.
 	// This supersedes the old /var/run env-dir copy + overlay-mount of .flox.
-	floxEnvGcrootBase = "/nix/var/nix/gcroots/flox-runtime/env"
-	floxOverlayHookPath       = "/usr/local/sbin/flox-nri-overlay-hook.sh"
-	floxEnvLinkHookPath       = "/usr/local/sbin/flox-nri-env-link-hook.sh"
-	floxChownHookPath         = "/usr/local/sbin/flox-nri-chown-hook.sh"
+	floxEnvGcrootBase   = "/nix/var/nix/gcroots/flox-runtime/env"
+	floxOverlayHookPath = "/usr/local/sbin/flox-nri-overlay-hook.sh"
+	floxEnvLinkHookPath = "/usr/local/sbin/flox-nri-env-link-hook.sh"
+	floxChownHookPath   = "/usr/local/sbin/flox-nri-chown-hook.sh"
 	// System-wide flox config maintained on the host by rke2lab-env-load.sh.
 	// We bind-mount it read-only into every flox-injected container so the in-
 	// container `flox` invocation honors host policy (telemetry off, channel
 	// lock, ...) without each pod having to set FLOX_* env vars.
-	floxSystemConfigPath      = "/etc/flox.toml"
+	floxSystemConfigPath = "/etc/flox.toml"
 	// The container's command is `flox activate …`, so flox must be on PATH BEFORE
 	// activation. flox is NOT in the injected env (that holds the workload's own
 	// packages) — it lives in the node's NixOS system profile. We resolve its
@@ -47,10 +47,10 @@ const (
 	// it on PATH ourselves: the plugin already depends on flox, so it owns bringing
 	// it in (retires the flox-env `NIX_DEFAULT_PROFILE_BIN_STORE_PATH` ConfigMap key).
 	nixosSystemFloxBin = "/run/current-system/sw/bin/flox"
-	defaultDebugPort          = "2345"
-	defaultUID                = "0"
-	defaultGID                = "0"
-	rootHome                  = "/root"
+	defaultDebugPort   = "2345"
+	defaultUID         = "0"
+	defaultGID         = "0"
+	rootHome           = "/root"
 )
 
 // FloxPlugin implements the NRI plugin interface for flox environment injection
@@ -268,6 +268,29 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		adjustment.AddEnv("PATH", newPath)
 		log.Printf("Injected flox onto container PATH: %s", floxBin)
 	}
+
+	// Disable flox's background "check-for-upgrades" in injected containers.
+	//
+	// WHY: every `flox activate` spawns a DETACHED check-for-upgrades process that
+	// runs `nix eval --refresh 'builtins.lockFlakeInstallable "<installable>"'` to
+	// look for newer package versions. That eval loads nixpkgs and (with --refresh)
+	// bypasses the eval cache, so it spikes memory UNBOUNDEDLY a few seconds AFTER
+	// activation returns — OOMKilling the container at ANY cgroup limit. It is
+	// pointless here: injected environments are baked, locked, and air-gapped, and
+	// their flake installables reference a source tree that isn't present at runtime.
+	// Measured: a mesh sidecar OOM'd >256Mi without this; with it, activation peaks
+	// at ~8Mi.
+	//
+	// FRAGILE: `_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS` is an INTERNAL flox testing
+	// knob, not a supported config key — flox reads it in
+	// cli/flox/src/commands/check_for_upgrades.rs
+	// (spawn_detached_check_for_upgrades_process: `if let Ok(true) =
+	// std::env::var("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS").unwrap_or_default().parse()
+	// { return Ok(()) }`, value must be "true"). It can change or vanish across flox
+	// releases. Revisit and switch to a supported mechanism if flox ever exposes one
+	// (there is no config-key / non-testing env var for this today).
+	adjustment.AddEnv("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS", "true")
+	log.Printf("Disabled flox background check-for-upgrades (avoids unbounded nix-eval OOM in injected containers)")
 
 	log.Printf("Successfully configured Flox environment injection for container %s/%s", pod.GetNamespace(), container.GetName())
 
