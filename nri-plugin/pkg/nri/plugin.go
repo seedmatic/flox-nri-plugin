@@ -17,12 +17,21 @@ const (
 	// Per-container annotation prefixes. The plugin reads
 	// "<prefix>.<container-name>" — there is NO fallback to the bare key or
 	// to a pod-wide annotation. Each container in a pod opts in independently.
-	floxEnvAnnotationPrefix   = "flox.dev/environment" // <prefix>.<container> = "category/name" (required to opt in)
-	floxHomeAnnotationPrefix  = "flox.dev/home"        // <prefix>.<container> = override HOME (optional)
-	floxUIDAnnotationPrefix   = "flox.dev/uid"         // <prefix>.<container> = desired UID (optional, default: 0)
-	floxGIDAnnotationPrefix   = "flox.dev/gid"         // <prefix>.<container> = desired GID (optional, default: 0)
-	floxDebugAnnotationPrefix = "flox.dev/debug"       // <prefix>.<container> = "true" to enable debug pause
-	floxDebugPortPrefix       = "flox.dev/debug-port"  // <prefix>.<container> = delve port (default: 2345)
+	floxEnvAnnotationPrefix   = "flox.seedmatic.io/environment" // <prefix>.<container> = "category/name" (opt into a flox env)
+	floxHomeAnnotationPrefix  = "flox.seedmatic.io/home"        // <prefix>.<container> = override HOME (optional)
+	floxUIDAnnotationPrefix   = "flox.seedmatic.io/uid"         // <prefix>.<container> = desired UID (optional, default: 0)
+	floxGIDAnnotationPrefix   = "flox.seedmatic.io/gid"         // <prefix>.<container> = desired GID (optional, default: 0)
+	floxDebugAnnotationPrefix = "flox.seedmatic.io/debug"       // <prefix>.<container> = "true" to enable debug pause
+	floxDebugPortPrefix       = "flox.seedmatic.io/debug-port"  // <prefix>.<container> = delve port (default: 2345)
+	// nixBuildAnnotationPrefix opts a container into the nix-build capability:
+	// flox.seedmatic.io/nix-build.<container> = "<pvc-name>". The pod-mutating webhook ensures that
+	// PVC + mounts it at nixBuildStoreMount; we host the /nix store overlay's upper/work THERE
+	// (instead of the default 2g tmpfs) so the container's `nix build` — which materialises a whole
+	// maven closure into the store — has room + a persistent warm cache. We also put `nix` on PATH.
+	nixBuildAnnotationPrefix = "flox.seedmatic.io/nix-build"
+	// nixBuildStoreMount is where the webhook mounts the assigned nix-store PVC — the shared contract
+	// between the webhook and this plugin's overlay upper_backing. Keep in sync with the webhook.
+	nixBuildStoreMount = "/var/lib/flox-nri/nix-build-store"
 	// Store-resolved env handoff. The runtime installer realizes each env's
 	// static subtree (env/{manifest.toml,manifest.lock}) into /nix/store and
 	// GC-roots it at <floxEnvGcrootBase>/<category>/<name>. We readlink that
@@ -47,10 +56,14 @@ const (
 	// it on PATH ourselves: the plugin already depends on flox, so it owns bringing
 	// it in (retires the flox-env `NIX_DEFAULT_PROFILE_BIN_STORE_PATH` ConfigMap key).
 	nixosSystemFloxBin = "/run/current-system/sw/bin/flox"
-	defaultDebugPort   = "2345"
-	defaultUID         = "0"
-	defaultGID         = "0"
-	rootHome           = "/root"
+	// nixosSystemNixBin: the node's `nix` CLI (NixOS system profile). A nix-build container gets it
+	// on PATH the same way flox does — the plugin owns bringing the nix runtime in, so no flox env
+	// has to ship `nix`. Resolved to its store bin dir (visible via the /nix overlay).
+	nixosSystemNixBin = "/run/current-system/sw/bin/nix"
+	defaultDebugPort  = "2345"
+	defaultUID        = "0"
+	defaultGID        = "0"
+	rootHome          = "/root"
 )
 
 // FloxPlugin implements the NRI plugin interface for flox environment injection
@@ -61,15 +74,17 @@ const (
 // This lets a pod mix flox-injected and unmodified containers freely.
 //
 // Supported keys (substitute <c> with the container name):
-//   - flox.dev/environment.<c>: Flox environment "category/name" (required to opt in)
-//   - flox.dev/home.<c>:        Override HOME directory (optional, defaults to HOME env var, then /root)
-//   - flox.dev/uid.<c>:         Desired UID for flox env ownership (optional, default: 0)
-//   - flox.dev/gid.<c>:         Desired GID for flox env ownership (optional, default: 0)
-//   - flox.dev/debug.<c>:       Set to "true" to enable debug mode (optional)
-//   - flox.dev/debug-port.<c>:  Delve debugger port (optional, default: 2345)
+//   - flox.seedmatic.io/environment.<c>: Flox environment "category/name" (opt into a flox env)
+//   - flox.seedmatic.io/home.<c>:        Override HOME directory (optional, defaults to HOME env var, then /root)
+//   - flox.seedmatic.io/uid.<c>:         Desired UID for flox env ownership (optional, default: 0)
+//   - flox.seedmatic.io/gid.<c>:         Desired GID for flox env ownership (optional, default: 0)
+//   - flox.seedmatic.io/debug.<c>:       Set to "true" to enable debug mode (optional)
+//   - flox.seedmatic.io/debug-port.<c>:  Delve debugger port (optional, default: 2345)
+//   - flox.seedmatic.io/nix-build.<c>:   Opt into the nix-build runtime — value is the PVC the
+//     webhook mounts at nixBuildStoreMount; we host the /nix overlay upper there + put nix on PATH
 //
 // Behavior:
-//   - Determines HOME directory: flox.dev/home.<c> > HOME env var > /root
+//   - Determines HOME directory: flox.seedmatic.io/home.<c> > HOME env var > /root
 //   - Resolves environment: "category/name" -> the store path GC-rooted at
 //     /nix/var/nix/gcroots/flox-runtime/env/{category}/{name} by the installer
 //   - Materializes a fine-grained .flox symlink farm at $HOME/.flox (env/ -> store,
@@ -117,183 +132,195 @@ func (p *FloxPlugin) Shutdown(ctx context.Context) {
 func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	containerName := container.GetName()
 
-	// Per-container annotation lookup. NO fallback: a container without
-	// `flox.dev/environment.<container-name>` is not flox-injected, even if
-	// a sibling container in the same pod has the annotation set.
+	// Per-container annotation lookup. NO fallback: a container without one of the
+	// flox.seedmatic.io/<capability>.<container-name> annotations is left untouched, even if a
+	// sibling container in the same pod opted in. A container may opt into a flox env, the
+	// nix-build runtime, or both.
 	envKey := perContainerKey(floxEnvAnnotationPrefix, containerName)
 	floxEnv := getAnnotation(pod, envKey)
-	if floxEnv == "" {
-		// Container did not opt in.
-		return nil, nil, nil
-	}
-
-	log.Printf("Container %s/%s requests flox environment: %s (via %s)",
-		pod.GetNamespace(), containerName, floxEnv, envKey)
-
-	// Optional debug pause — also per-container.
-	if getAnnotation(pod, perContainerKey(floxDebugAnnotationPrefix, containerName)) == "true" {
-		debugPort := getAnnotation(pod, perContainerKey(floxDebugPortPrefix, containerName))
-		if debugPort == "" {
-			debugPort = defaultDebugPort
-		}
-		log.Printf("DEBUG MODE: Waiting for debugger on port %s for %s/%s", debugPort, pod.GetNamespace(), containerName)
-		log.Printf("Attach with: dlv connect localhost:%s", debugPort)
-	}
-
-	// Get UID/GID from container user (NRI v0.12.0+)
-	// Priority: 1) Container.User, 2) per-container annotation, 3) default to root
-	var uid, gid string
-	user := container.GetUser()
-	if user != nil {
-		uid = fmt.Sprintf("%d", user.GetUid())
-		gid = fmt.Sprintf("%d", user.GetGid())
-		log.Printf("Container user UID=%s, GID=%s", uid, gid)
-	} else {
-		uid = getAnnotation(pod, perContainerKey(floxUIDAnnotationPrefix, containerName))
-		if uid == "" {
-			uid = defaultUID
-		}
-		gid = getAnnotation(pod, perContainerKey(floxGIDAnnotationPrefix, containerName))
-		if gid == "" {
-			gid = defaultGID
-		}
-		log.Printf("Using annotations/defaults: UID=%s, GID=%s", uid, gid)
-	}
-
-	// Determine HOME where .flox will be mounted.
-	// Priority: flox.dev/home.<c> > HOME env var > infer from UID
-	homeDir := getAnnotation(pod, perContainerKey(floxHomeAnnotationPrefix, containerName))
-	if homeDir == "" {
-		homeDir = getEnvVar(container, "HOME")
-	}
-	if homeDir == "" {
-		if uid == "0" {
-			homeDir = rootHome
-		} else {
-			homeDir = fmt.Sprintf("/home/user-%s", uid)
-		}
-	}
-
-	log.Printf("Using HOME directory: %s (will mount .flox at %s/.flox)", homeDir, homeDir)
-	log.Printf("Flox environment ownership: UID=%s, GID=%s", uid, gid)
-
-	// Resolve the flox environment path
-	floxEnvPath, err := p.resolveFloxEnvironment(floxEnv)
-	if err != nil {
-		log.Printf("ERROR: Failed to resolve flox environment %s: %v", floxEnv, err)
-		return nil, nil, fmt.Errorf("failed to resolve flox environment: %w", err)
-	}
-
-	log.Printf("Flox environment %s resolved to store path: %s", floxEnv, floxEnvPath)
-
-	// Target path where we materialize the env's .flox symlink farm: $HOME/.flox
-	floxMountTarget := filepath.Join(homeDir, ".flox")
-
-	if uid != defaultUID || gid != defaultGID {
-		log.Printf("WARNING: UID/GID mapping requested (uid=%s, gid=%s) but not yet implemented", uid, gid)
-		log.Printf("The flox environment source must have correct ownership on the host filesystem")
+	nixBuild := getAnnotation(pod, perContainerKey(nixBuildAnnotationPrefix, containerName))
+	if floxEnv == "" && nixBuild == "" {
+		return nil, nil, nil // opted into nothing
 	}
 
 	adjustment := &api.ContainerAdjustment{}
+	var createHooks []*api.Hook
+	var prestartHooks []*api.Hook
 
-	// CreateContainer hooks run in the container's mount namespace before
-	// pivot_root, so what they write persists after pivot_root. CreateRuntime
-	// would NOT work here: it runs in the host/runtime namespace, and the
-	// container ns is unshared with rprivate propagation so host-side mounts
-	// don't reach the container.
-	//
-	// 1) nix overlay: read-only host /nix lower + writable ephemeral tmpfs upper.
-	//    ONE overlay over all of /nix gives the container a VALID store — the store
-	//    FILES and the registration DB (/nix/var/nix/db) that validates them — so
-	//    `flox activate` realises the baked activation as a cache-hit instead of
-	//    force-registering the closure (re-hashing go/delve/… → OOM on every start).
-	//    The overlay hook strips the host's stale daemon socket after mounting so
-	//    nix stays on the local store (no daemon in the container).
-	nixOverlayHook := &api.Hook{
-		Path: floxOverlayHookPath,
-		Args: []string{floxOverlayHookPath, "nix", "/nix", "/nix"},
+	// The /nix overlay is needed by BOTH capabilities. CreateContainer hooks run in the container's
+	// mount namespace before pivot_root, so what they mount persists after pivot_root (CreateRuntime
+	// runs in the host ns and would NOT reach the container). ONE overlay over all of /nix gives a
+	// VALID store — the files + the registration DB (/nix/var/nix/db) — so flox activation is a
+	// cache-hit and a nix build has a writable store. upper/work default to the hook's 2g tmpfs; a
+	// nix-build container hosts them on its assigned PVC (mounted by the webhook at
+	// nixBuildStoreMount) for room + a persistent warm cache. The hook strips the host's stale
+	// daemon socket so nix stays on the local store.
+	nixOverlayArgs := []string{floxOverlayHookPath, "nix", "/nix", "/nix"}
+	if nixBuild != "" {
+		nixOverlayArgs = append(nixOverlayArgs, nixBuildStoreMount)
+		log.Printf("nix-build %s/%s: /nix overlay upper on the assigned store PVC at %s (annotation=%q)",
+			pod.GetNamespace(), containerName, nixBuildStoreMount, nixBuild)
 	}
-	log.Printf("Adding CreateContainer hook (nix): %s /nix -> /nix", floxOverlayHookPath)
+	createHooks = append(createHooks, &api.Hook{Path: floxOverlayHookPath, Args: nixOverlayArgs})
+	log.Printf("Adding CreateContainer hook (nix overlay): %s /nix -> /nix", floxOverlayHookPath)
 
-	// 2) env-link: build the fine-grained .flox symlink farm — env/ symlinks
-	//    into the resolved store path (immutable default env), run/cache/log are
-	//    real local writable dirs. Replaces the old overlay-mount of .flox,
-	//    which mutated/clamped the env tree and broke relative flake refs.
-	floxEnvLinkHook := &api.Hook{
-		Path: floxEnvLinkHookPath,
-		Args: []string{floxEnvLinkHookPath, floxEnvPath, floxMountTarget},
-	}
-	log.Printf("Adding CreateContainer hook (env-link): %s %s -> %s", floxEnvLinkHookPath, floxEnvPath, floxMountTarget)
-
-	// Prestart hook fixes ownership of $HOME and $HOME/.flox via ${bundle}/rootfs.
-	// Runs in the host namespace; the container rootfs is reachable from there.
-	chownHook := &api.Hook{
-		Path: floxChownHookPath,
-		Args: []string{floxChownHookPath, uid, gid, homeDir},
-	}
-	log.Printf("Adding Prestart hook: %s %s %s %s", floxChownHookPath, uid, gid, homeDir)
-
-	adjustment.AddHooks(&api.Hooks{
-		CreateContainer: []*api.Hook{nixOverlayHook, floxEnvLinkHook},
-		Prestart:        []*api.Hook{chownHook},
-	})
-
-	// Project host /etc/flox.toml into the container if the host has one. The
-	// host file is the system-wide opt-out for flox telemetry (and any future
-	// host-wide flox policy). Read-only — pods can't shadow it. Skipping
-	// silently when the host file is absent keeps the plugin permissive on
-	// nodes that haven't run rke2lab-env-load.sh yet.
-	if _, err := os.Stat(floxSystemConfigPath); err == nil {
-		adjustment.AddMount(&api.Mount{
-			Source:      floxSystemConfigPath,
-			Destination: floxSystemConfigPath,
-			Type:        "bind",
-			Options:     []string{"bind", "ro"},
-		})
-		log.Printf("Bind-mounted host %s into container", floxSystemConfigPath)
-	}
-
-	// Put flox on the container PATH so `flox activate` (the container command)
-	// can find it. Prepend flox's store bin to any existing PATH; otherwise seed a
-	// sane default alongside it.
-	if floxBin, ferr := resolveFloxStoreBin(); ferr != nil {
-		log.Printf("WARNING: could not resolve flox store bin (%v) — container PATH not adjusted, `flox activate` may fail", ferr)
-	} else {
-		newPath := floxBin
-		if existing := getEnvVar(container, "PATH"); existing != "" {
-			newPath = floxBin + ":" + existing
+	// nix-build: put the node's `nix` CLI on PATH (the plugin owns the nix runtime — no flox env has
+	// to ship nix). NIX_CONFIG for daemonless single-user nix is injected by the pod-mutating webhook.
+	if nixBuild != "" {
+		if nixBin, nerr := resolveNixStoreBin(); nerr != nil {
+			log.Printf("WARNING: could not resolve nix store bin (%v) — nix-build container PATH not adjusted", nerr)
 		} else {
-			newPath = floxBin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+			adjustment.AddEnv("PATH", prependPath(nixBin, getEnvVar(container, "PATH")))
+			log.Printf("Injected nix onto container PATH: %s", nixBin)
 		}
-		adjustment.AddEnv("PATH", newPath)
-		log.Printf("Injected flox onto container PATH: %s", floxBin)
+		// TODO(nix-build GC): the assigned store PVC is persistent + reused across renders, so it
+		// grows unbounded. This plugin OWNS bounding it — a threshold-gated `nix store gc` on the
+		// overlay (reaps unrooted UPPER paths; the node lower is fully gcrooted, so it is untouched
+		// and the merged view stays coherent). Must land before a long-lived cluster relies on this.
 	}
 
-	// Disable flox's background "check-for-upgrades" in injected containers.
-	//
-	// WHY: every `flox activate` spawns a DETACHED check-for-upgrades process that
-	// runs `nix eval --refresh 'builtins.lockFlakeInstallable "<installable>"'` to
-	// look for newer package versions. That eval loads nixpkgs and (with --refresh)
-	// bypasses the eval cache, so it spikes memory UNBOUNDEDLY a few seconds AFTER
-	// activation returns — OOMKilling the container at ANY cgroup limit. It is
-	// pointless here: injected environments are baked, locked, and air-gapped, and
-	// their flake installables reference a source tree that isn't present at runtime.
-	// Measured: a mesh sidecar OOM'd >256Mi without this; with it, activation peaks
-	// at ~8Mi.
-	//
-	// FRAGILE: `_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS` is an INTERNAL flox testing
-	// knob, not a supported config key — flox reads it in
-	// cli/flox/src/commands/check_for_upgrades.rs
-	// (spawn_detached_check_for_upgrades_process: `if let Ok(true) =
-	// std::env::var("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS").unwrap_or_default().parse()
-	// { return Ok(()) }`, value must be "true"). It can change or vanish across flox
-	// releases. Revisit and switch to a supported mechanism if flox ever exposes one
-	// (there is no config-key / non-testing env var for this today).
-	adjustment.AddEnv("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS", "true")
-	log.Printf("Disabled flox background check-for-upgrades (avoids unbounded nix-eval OOM in injected containers)")
+	// flox env injection — only when the container opted into a flox env.
+	if floxEnv != "" {
+		log.Printf("Container %s/%s requests flox environment: %s (via %s)",
+			pod.GetNamespace(), containerName, floxEnv, envKey)
 
-	log.Printf("Successfully configured Flox environment injection for container %s/%s", pod.GetNamespace(), container.GetName())
+		// Optional debug pause — also per-container.
+		if getAnnotation(pod, perContainerKey(floxDebugAnnotationPrefix, containerName)) == "true" {
+			debugPort := getAnnotation(pod, perContainerKey(floxDebugPortPrefix, containerName))
+			if debugPort == "" {
+				debugPort = defaultDebugPort
+			}
+			log.Printf("DEBUG MODE: Waiting for debugger on port %s for %s/%s", debugPort, pod.GetNamespace(), containerName)
+			log.Printf("Attach with: dlv connect localhost:%s", debugPort)
+		}
 
+		// Get UID/GID from container user (NRI v0.12.0+)
+		// Priority: 1) Container.User, 2) per-container annotation, 3) default to root
+		var uid, gid string
+		user := container.GetUser()
+		if user != nil {
+			uid = fmt.Sprintf("%d", user.GetUid())
+			gid = fmt.Sprintf("%d", user.GetGid())
+			log.Printf("Container user UID=%s, GID=%s", uid, gid)
+		} else {
+			uid = getAnnotation(pod, perContainerKey(floxUIDAnnotationPrefix, containerName))
+			if uid == "" {
+				uid = defaultUID
+			}
+			gid = getAnnotation(pod, perContainerKey(floxGIDAnnotationPrefix, containerName))
+			if gid == "" {
+				gid = defaultGID
+			}
+			log.Printf("Using annotations/defaults: UID=%s, GID=%s", uid, gid)
+		}
+
+		// Determine HOME where .flox will be mounted.
+		// Priority: flox.seedmatic.io/home.<c> > HOME env var > infer from UID
+		homeDir := getAnnotation(pod, perContainerKey(floxHomeAnnotationPrefix, containerName))
+		if homeDir == "" {
+			homeDir = getEnvVar(container, "HOME")
+		}
+		if homeDir == "" {
+			if uid == "0" {
+				homeDir = rootHome
+			} else {
+				homeDir = fmt.Sprintf("/home/user-%s", uid)
+			}
+		}
+
+		log.Printf("Using HOME directory: %s (will mount .flox at %s/.flox)", homeDir, homeDir)
+		log.Printf("Flox environment ownership: UID=%s, GID=%s", uid, gid)
+
+		floxEnvPath, err := p.resolveFloxEnvironment(floxEnv)
+		if err != nil {
+			log.Printf("ERROR: Failed to resolve flox environment %s: %v", floxEnv, err)
+			return nil, nil, fmt.Errorf("failed to resolve flox environment: %w", err)
+		}
+		log.Printf("Flox environment %s resolved to store path: %s", floxEnv, floxEnvPath)
+
+		// Target path where we materialize the env's .flox symlink farm: $HOME/.flox
+		floxMountTarget := filepath.Join(homeDir, ".flox")
+
+		if uid != defaultUID || gid != defaultGID {
+			log.Printf("WARNING: UID/GID mapping requested (uid=%s, gid=%s) but not yet implemented", uid, gid)
+			log.Printf("The flox environment source must have correct ownership on the host filesystem")
+		}
+
+		// env-link: build the fine-grained .flox symlink farm — env/ symlinks into the resolved
+		// store path (immutable default env), run/cache/log are real local writable dirs.
+		createHooks = append(createHooks, &api.Hook{
+			Path: floxEnvLinkHookPath,
+			Args: []string{floxEnvLinkHookPath, floxEnvPath, floxMountTarget},
+		})
+		log.Printf("Adding CreateContainer hook (env-link): %s %s -> %s", floxEnvLinkHookPath, floxEnvPath, floxMountTarget)
+
+		// Prestart hook fixes ownership of $HOME and $HOME/.flox via ${bundle}/rootfs (host ns).
+		prestartHooks = append(prestartHooks, &api.Hook{
+			Path: floxChownHookPath,
+			Args: []string{floxChownHookPath, uid, gid, homeDir},
+		})
+		log.Printf("Adding Prestart hook: %s %s %s %s", floxChownHookPath, uid, gid, homeDir)
+
+		// Project host /etc/flox.toml into the container if the host has one. The
+		// host file is the system-wide opt-out for flox telemetry (and any future
+		// host-wide flox policy). Read-only — pods can't shadow it. Skipping
+		// silently when the host file is absent keeps the plugin permissive on
+		// nodes that haven't run rke2lab-env-load.sh yet.
+		if _, err := os.Stat(floxSystemConfigPath); err == nil {
+			adjustment.AddMount(&api.Mount{
+				Source:      floxSystemConfigPath,
+				Destination: floxSystemConfigPath,
+				Type:        "bind",
+				Options:     []string{"bind", "ro"},
+			})
+			log.Printf("Bind-mounted host %s into container", floxSystemConfigPath)
+		}
+
+		// Put flox on the container PATH so `flox activate` (the container command)
+		// can find it. Prepend flox's store bin to any existing PATH; otherwise seed a
+		// sane default alongside it.
+		if floxBin, ferr := resolveFloxStoreBin(); ferr != nil {
+			log.Printf("WARNING: could not resolve flox store bin (%v) — container PATH not adjusted, `flox activate` may fail", ferr)
+		} else {
+			newPath := floxBin
+			if existing := getEnvVar(container, "PATH"); existing != "" {
+				newPath = floxBin + ":" + existing
+			} else {
+				newPath = floxBin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+			}
+			adjustment.AddEnv("PATH", newPath)
+			log.Printf("Injected flox onto container PATH: %s", floxBin)
+		}
+
+		// Disable flox's background "check-for-upgrades" in injected containers.
+		//
+		// WHY: every `flox activate` spawns a DETACHED check-for-upgrades process that
+		// runs `nix eval --refresh 'builtins.lockFlakeInstallable "<installable>"'` to
+		// look for newer package versions. That eval loads nixpkgs and (with --refresh)
+		// bypasses the eval cache, so it spikes memory UNBOUNDEDLY a few seconds AFTER
+		// activation returns — OOMKilling the container at ANY cgroup limit. It is
+		// pointless here: injected environments are baked, locked, and air-gapped, and
+		// their flake installables reference a source tree that isn't present at runtime.
+		// Measured: a mesh sidecar OOM'd >256Mi without this; with it, activation peaks
+		// at ~8Mi.
+		//
+		// FRAGILE: `_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS` is an INTERNAL flox testing
+		// knob, not a supported config key — flox reads it in
+		// cli/flox/src/commands/check_for_upgrades.rs
+		// (spawn_detached_check_for_upgrades_process: `if let Ok(true) =
+		// std::env::var("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS").unwrap_or_default().parse()
+		// { return Ok(()) }`, value must be "true"). It can change or vanish across flox
+		// releases. Revisit and switch to a supported mechanism if flox ever exposes one
+		// (there is no config-key / non-testing env var for this today).
+		adjustment.AddEnv("_FLOX_TESTING_DISABLE_BG_SIDE_EFFECTS", "true")
+		log.Printf("Disabled flox background check-for-upgrades (avoids unbounded nix-eval OOM in injected containers)")
+	}
+
+	if len(createHooks) > 0 || len(prestartHooks) > 0 {
+		adjustment.AddHooks(&api.Hooks{CreateContainer: createHooks, Prestart: prestartHooks})
+	}
+
+	log.Printf("Successfully configured flox injection for container %s/%s", pod.GetNamespace(), container.GetName())
 	return adjustment, nil, nil
 }
 
@@ -312,6 +339,30 @@ func resolveFloxStoreBin() (string, error) {
 		return filepath.Dir(p), nil
 	}
 	return "", fmt.Errorf("flox not found at %s or on PATH", nixosSystemFloxBin)
+}
+
+// resolveNixStoreBin returns the /nix/store bin dir holding the node's `nix` CLI (NixOS system
+// profile symlink resolved to its store path, visible in the container via the /nix overlay),
+// falling back to a PATH lookup. The plugin owns bringing the nix runtime in for nix-build pods.
+func resolveNixStoreBin() (string, error) {
+	if resolved, err := filepath.EvalSymlinks(nixosSystemNixBin); err == nil {
+		return filepath.Dir(resolved), nil
+	}
+	if p, err := exec.LookPath("nix"); err == nil {
+		if resolved, rerr := filepath.EvalSymlinks(p); rerr == nil {
+			return filepath.Dir(resolved), nil
+		}
+		return filepath.Dir(p), nil
+	}
+	return "", fmt.Errorf("nix not found at %s or on PATH", nixosSystemNixBin)
+}
+
+// prependPath puts bin at the front of an existing PATH, or seeds a sane default when empty.
+func prependPath(bin, existing string) string {
+	if existing != "" {
+		return bin + ":" + existing
+	}
+	return bin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
 // RemoveContainer is called when a container is removed

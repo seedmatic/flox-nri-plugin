@@ -19,12 +19,24 @@
 #   /.overlays.d/<name>/rw/work       workdir
 # An overlay is then mounted at <target>.
 #
-# Usage: flox-nri-overlay-hook.sh <name> <lower-source> <target>
+# The default upper/work backing is an ephemeral 2g tmpfs — right for a sidecar
+# whose store overlay only records a few activation writes. A heavy consumer that
+# BUILDS into the store (e.g. the in-cluster render's `nix build`, which
+# materialises a maven closure into $out) blows past 2g, so it passes an optional
+# <upper-backing>: a container-absolute path where a sized, writable volume (a PVC)
+# is already mounted. We then host upper/ and work/ THERE instead of a tmpfs — real
+# disk + inodes, and (if the volume persists) the built store paths survive across
+# runs so the next render is a cache hit.
+#
+# Usage: flox-nri-overlay-hook.sh <name> <lower-source> <target> [<upper-backing>]
 #   <name>          short identifier for the overlay; used as the subfolder
 #                   name under /.overlays.d/
 #   <lower-source>  host filesystem path used as the read-only lower layer
 #   <target>        absolute path inside the container rootfs for the overlay
 #                   mountpoint
+#   <upper-backing> OPTIONAL container-absolute path of a pre-mounted writable
+#                   volume to host upper/ + work/ (both land on it → same mount, as
+#                   overlayfs requires). Omitted/empty → the 2g tmpfs default.
 #
 # Logging: the OCI runtime (containerd/runc) captures the hook's stdout/stderr and
 # surfaces it on the pod's events + containerd log, so we log there directly. We do
@@ -36,6 +48,7 @@
 overlay_name="$1"
 lower_source="$2"
 target_rel="$3"
+upper_backing_rel="${4:-}"
 
 state="$(cat)"
 bundle="$(printf '%s' "$state" | sed -n 's/.*"bundle"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
@@ -57,18 +70,34 @@ fi
 target="${rootfs}${target_rel}"
 overlay_root="${rootfs}/.overlays.d/${overlay_name}"
 lower="${overlay_root}/lower"
-rw="${overlay_root}/rw"
-upper="${rw}/upper"
-work="${rw}/work"
 
-mkdir -p "$target" "$lower" "$rw"
+mkdir -p "$target" "$lower"
 
 mount --bind "$lower_source" "$lower"
 mount -o remount,bind,ro "$lower"
 
-# Single tmpfs hosting both upper/ and work/ — overlayfs requires upperdir and
-# workdir to reside on the same mount.
-mount -t tmpfs -o mode=0755,size=2g tmpfs "$rw"
+# upper/ + work/ backing. overlayfs requires both on the SAME mount.
+if [ -n "$upper_backing_rel" ]; then
+    # PVC-backed: the volume is already mounted by the runtime at this
+    # container-absolute path. Host upper/ + work/ on it directly — real disk +
+    # inodes, and it persists across runs so built store paths stay cached.
+    rw="${rootfs}${upper_backing_rel}"
+    container_rw="${upper_backing_rel}"
+    if [ ! -d "$rw" ]; then
+        echo "ERROR: upper-backing path not mounted in container: ${upper_backing_rel}" >&2
+        exit 1
+    fi
+    echo "overlay ${overlay_name}: PVC-backed upper/work at ${upper_backing_rel}"
+else
+    # Ephemeral default: a single 2g tmpfs hosting upper/ and work/.
+    rw="${overlay_root}/rw"
+    container_rw="/.overlays.d/${overlay_name}/rw"
+    mkdir -p "$rw"
+    mount -t tmpfs -o mode=0755,size=2g tmpfs "$rw"
+    echo "overlay ${overlay_name}: ephemeral 2g tmpfs upper/work"
+fi
+upper="${rw}/upper"
+work="${rw}/work"
 mkdir -p "$upper" "$work"
 
 # We MUST chroot into ${rootfs} to create the overlay: overlayfs records
@@ -88,8 +117,8 @@ mkdir -p "$upper" "$work"
 install -Dm0755 "$FLOX_NRI_MOUNT_BIN" "${rootfs}/.flox-nri/sbin/mount"
 
 container_lower="/.overlays.d/${overlay_name}/lower"
-container_upper="/.overlays.d/${overlay_name}/rw/upper"
-container_work="/.overlays.d/${overlay_name}/rw/work"
+container_upper="${container_rw}/upper"
+container_work="${container_rw}/work"
 
 chroot "$rootfs" /.flox-nri/sbin/mount -t overlay overlay \
     -o "lowerdir=${container_lower},upperdir=${container_upper},workdir=${container_work}" \
