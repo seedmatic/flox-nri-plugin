@@ -164,19 +164,26 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	createHooks = append(createHooks, &api.Hook{Path: floxOverlayHookPath, Args: nixOverlayArgs})
 	log.Printf("Adding CreateContainer hook (nix overlay): %s /nix -> /nix", floxOverlayHookPath)
 
-	// nix-build: put the node's `nix` CLI on PATH (the plugin owns the nix runtime — no flox env has
-	// to ship nix). NIX_CONFIG for daemonless single-user nix is injected by the pod-mutating webhook.
+	// nix-build: the plugin owns the nix runtime (no flox env ships nix).
 	if nixBuild != "" {
+		// (1) the node's `nix` CLI on PATH.
 		if nixBin, nerr := resolveNixStoreBin(); nerr != nil {
 			log.Printf("WARNING: could not resolve nix store bin (%v) — nix-build container PATH not adjusted", nerr)
 		} else {
 			adjustment.AddEnv("PATH", prependPath(nixBin, getEnvVar(container, "PATH")))
 			log.Printf("Injected nix onto container PATH: %s", nixBin)
 		}
-		// TODO(nix-build GC): the assigned store PVC is persistent + reused across renders, so it
-		// grows unbounded. This plugin OWNS bounding it — a threshold-gated `nix store gc` on the
-		// overlay (reaps unrooted UPPER paths; the node lower is fully gcrooted, so it is untouched
-		// and the merged view stays coherent). Must land before a long-lived cluster relies on this.
+		// (2) NIX_SSL_CERT_FILE → the node's CA bundle. nix fetches flake inputs + substituters over
+		// HTTPS, but the workload image (debian-slim) has no CA bundle, and the node's
+		// /etc/ssl/certs/… is NOT overlaid (only /nix is). Resolve the node cacert to its /nix/store
+		// path (which IS overlaid → visible in the pod) so TLS verification works. NIX_CONFIG (the
+		// daemonless knobs + min-free/max-free store GC) is injected by the pod-mutating webhook.
+		if caBundle, cerr := resolveNixCaBundle(); cerr != nil {
+			log.Printf("WARNING: could not resolve a /nix/store CA bundle (%v) — nix HTTPS fetches may fail", cerr)
+		} else {
+			adjustment.AddEnv("NIX_SSL_CERT_FILE", caBundle)
+			log.Printf("Injected NIX_SSL_CERT_FILE: %s", caBundle)
+		}
 	}
 
 	// flox env injection — only when the container opted into a flox env.
@@ -355,6 +362,25 @@ func resolveNixStoreBin() (string, error) {
 		return filepath.Dir(p), nil
 	}
 	return "", fmt.Errorf("nix not found at %s or on PATH", nixosSystemNixBin)
+}
+
+// resolveNixCaBundle returns a CA bundle path UNDER /nix/store — the only tree overlaid into the
+// pod, so the only cacert the container can actually read. It resolves the node's NIX_SSL_CERT_FILE
+// (set on NixOS) or the standard /etc/ssl/certs/ca-certificates.crt symlink to its store target.
+func resolveNixCaBundle() (string, error) {
+	for _, candidate := range []string{os.Getenv("NIX_SSL_CERT_FILE"), "/etc/ssl/certs/ca-certificates.crt"} {
+		if candidate == "" {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(resolved, "/nix/store/") {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("no /nix/store CA bundle via NIX_SSL_CERT_FILE or /etc/ssl/certs/ca-certificates.crt")
 }
 
 // prependPath puts bin at the front of an existing PATH, or seeds a sane default when empty.
