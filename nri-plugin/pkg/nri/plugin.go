@@ -146,6 +146,10 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 	adjustment := &api.ContainerAdjustment{}
 	var createHooks []*api.Hook
 	var prestartHooks []*api.Hook
+	// PATH prefixes each capability contributes (nix bin for nix-build, flox bin for a flox env).
+	// Accumulated and set ONCE at the end: NRI rejects a plugin that sets Env PATH twice, so the
+	// "both capabilities" case (nix-build + environment) must merge into a single AddEnv.
+	var pathPrefixes []string
 
 	// The /nix overlay is needed by BOTH capabilities. CreateContainer hooks run in the container's
 	// mount namespace before pivot_root, so what they mount persists after pivot_root (CreateRuntime
@@ -170,8 +174,8 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		if nixBin, nerr := resolveNixStoreBin(); nerr != nil {
 			log.Printf("WARNING: could not resolve nix store bin (%v) — nix-build container PATH not adjusted", nerr)
 		} else {
-			adjustment.AddEnv("PATH", prependPath(nixBin, getEnvVar(container, "PATH")))
-			log.Printf("Injected nix onto container PATH: %s", nixBin)
+			pathPrefixes = append(pathPrefixes, nixBin)
+			log.Printf("nix on container PATH: %s", nixBin)
 		}
 		// (2) NIX_SSL_CERT_FILE → the node's CA bundle. nix fetches flake inputs + substituters over
 		// HTTPS, but the workload image (debian-slim) has no CA bundle, and the node's
@@ -289,14 +293,19 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		if floxBin, ferr := resolveFloxStoreBin(); ferr != nil {
 			log.Printf("WARNING: could not resolve flox store bin (%v) — container PATH not adjusted, `flox activate` may fail", ferr)
 		} else {
-			newPath := floxBin
-			if existing := getEnvVar(container, "PATH"); existing != "" {
-				newPath = floxBin + ":" + existing
-			} else {
-				newPath = floxBin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-			}
-			adjustment.AddEnv("PATH", newPath)
-			log.Printf("Injected flox onto container PATH: %s", floxBin)
+			pathPrefixes = append(pathPrefixes, floxBin)
+		}
+
+		// Auto-activate: rewrite the container command to run INSIDE the flox env, so a consumer
+		// never has to wrap ITSELF in `flox activate` — the plugin owns activation (which also runs
+		// the env's activation hooks, e.g. git-sops wiring the sops-yaml git filter — not just PATH).
+		// A container that opts into BOTH capabilities (nix-build + a flox env) thus runs its command
+		// with nix on PATH AND inside the activated env. Idempotent: skip a command that is ALREADY a
+		// `flox activate` (a consumer that still wraps explicitly, or a re-adjust), so the migration
+		// off explicit wrappers is safe without atomicity.
+		if origArgs := container.GetArgs(); len(origArgs) > 0 && !isFloxActivate(origArgs) {
+			adjustment.SetArgs(append([]string{"flox", "activate", "--dir", homeDir, "--"}, origArgs...))
+			log.Printf("Auto-wrapped %s/%s in `flox activate --dir %s --`", pod.GetNamespace(), containerName, homeDir)
 		}
 
 		// Disable flox's background "check-for-upgrades" in injected containers.
@@ -323,12 +332,30 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		log.Printf("Disabled flox background check-for-upgrades (avoids unbounded nix-eval OOM in injected containers)")
 	}
 
+	// ONE PATH set for both capabilities (NRI rejects a plugin setting Env PATH twice): the
+	// accumulated bin prefixes, then the container's existing PATH (or a sane default).
+	if len(pathPrefixes) > 0 {
+		base := getEnvVar(container, "PATH")
+		if base == "" {
+			base = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+		}
+		adjustment.AddEnv("PATH", strings.Join(pathPrefixes, ":")+":"+base)
+		log.Printf("Injected onto container PATH: %v", pathPrefixes)
+	}
+
 	if len(createHooks) > 0 || len(prestartHooks) > 0 {
 		adjustment.AddHooks(&api.Hooks{CreateContainer: createHooks, Prestart: prestartHooks})
 	}
 
 	log.Printf("Successfully configured flox injection for container %s/%s", pod.GetNamespace(), container.GetName())
 	return adjustment, nil, nil
+}
+
+// isFloxActivate reports whether args ALREADY invoke `flox activate` (basename flox + verb
+// activate) — the guard that keeps the auto-wrap idempotent (never `flox activate -- flox
+// activate …`), so a consumer that still wraps explicitly, or a re-adjustment, is left as-is.
+func isFloxActivate(args []string) bool {
+	return len(args) >= 2 && filepath.Base(args[0]) == "flox" && args[1] == "activate"
 }
 
 // resolveFloxStoreBin returns the /nix/store bin directory that holds the `flox`
@@ -381,14 +408,6 @@ func resolveNixCaBundle() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no /nix/store CA bundle via NIX_SSL_CERT_FILE or /etc/ssl/certs/ca-certificates.crt")
-}
-
-// prependPath puts bin at the front of an existing PATH, or seeds a sane default when empty.
-func prependPath(bin, existing string) string {
-	if existing != "" {
-		return bin + ":" + existing
-	}
-	return bin + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 }
 
 // RemoveContainer is called when a container is removed
