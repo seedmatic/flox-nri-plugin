@@ -303,9 +303,16 @@ func (p *FloxPlugin) CreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		// with nix on PATH AND inside the activated env. Idempotent: skip a command that is ALREADY a
 		// `flox activate` (a consumer that still wraps explicitly, or a re-adjust), so the migration
 		// off explicit wrappers is safe without atomicity.
-		if origArgs := container.GetArgs(); len(origArgs) > 0 && !isFloxActivate(origArgs) {
-			adjustment.SetArgs(append([]string{"flox", "activate", "--dir", homeDir, "--"}, origArgs...))
-			log.Printf("Auto-wrapped %s/%s in `flox activate --dir %s --`", pod.GetNamespace(), containerName, homeDir)
+		if origArgs := container.GetArgs(); len(origArgs) > 0 {
+			if isFloxActivate(origArgs) {
+				// The guard in action: a consumer still wrapping ITSELF in `flox activate` is left
+				// as-is (no double-wrap). Logged so the migration off explicit wrappers can be
+				// tracked live — every skip line names a container still to migrate.
+				log.Printf("Skipped auto-wrap for %s/%s: command is already `flox activate`", pod.GetNamespace(), containerName)
+			} else {
+				adjustment.SetArgs(append([]string{"flox", "activate", "--dir", homeDir, "--"}, origArgs...))
+				log.Printf("Auto-wrapped %s/%s in `flox activate --dir %s --`", pod.GetNamespace(), containerName, homeDir)
+			}
 		}
 
 		// Disable flox's background "check-for-upgrades" in injected containers.
