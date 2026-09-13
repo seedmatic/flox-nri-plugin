@@ -1,6 +1,22 @@
 {
   description = "Flox containerd NRI plugin (fork) — injects flox (nix-built) environments into Kubernetes pods via a store-resolved overlay";
 
+  # Public flake: consumers outside the fleet lack ndh's system-wide cache-trust, so declare the
+  # non-default binary caches this flake's closure resolves from. ADDITIVE (extra-*) + public-read,
+  # honoured via --accept-flake-config — an external clone or CI substitutes instead of rebuilding.
+  #   - nxmatic.cachix.org : where our build of the plugin is published (substituted, not rebuilt).
+  #   - cache.flox.dev     : this flake builds against flake-commons' nixpkgs and lives in the flox
+  #                          ecosystem (its closure pulls flox/nixpkgs fork nodes), whose store paths
+  #                          are on flox's cache rather than cache.nixos.org.
+  nixConfig.extra-substituters = [
+    "https://cache.flox.dev"
+    "https://nxmatic.cachix.org"
+  ];
+  nixConfig.extra-trusted-public-keys = [
+    "flox-cache-public-1:7F4OyH7ZCnFhcze3fJdfyXYLQw/aV7GEed86nQ7IsOs="
+    "nxmatic.cachix.org-1:huMghYiwDpPa1PMXHXK4G1Dp4QOZjgsNqxcjf/AjuJ0="
+  ];
+
   inputs = {
     # Externals follow the seedmatic aggregator so the whole closure (this flake
     # + rke2lab which inputs it) resolves to ONE nixpkgs — no skew.
