@@ -58,7 +58,7 @@
     flake-commons.inputs.treefmt-nix.follows = "nixpkgs";
   };
 
-  outputs = {
+  outputs = inputs @ {
     self,
     nixpkgs,
     flake-utils,
@@ -144,6 +144,22 @@
         }
         # flox-nri-hooks is Linux-only (util-linux); don't expose it on darwin.
         // lib.optionalAttrs pkgs.stdenv.isLinux {inherit flox-nri-hooks;};
+
+      # relock — THIS repo's locks, by the shared implementation in nix-flake-commons'
+      # `lib.mkRelockApp`. `consumers` names rke2lab, which pins this repo as its `flox-runtime` input.
+      apps.relock = {
+        type = "app";
+        program = "${
+          inputs.flake-commons.lib.mkRelockApp {
+            inherit pkgs;
+            name = "flox-nri-plugin";
+            slug = "seedmatic/flox-nri-plugin";
+            url = "https://github.com/seedmatic/flox-nri-plugin.git";
+            consumers = ["github:seedmatic/rke2lab"];
+          }
+        }/bin/relock";
+        meta.description = "Reconcile THIS repo's locks: bump each input, DROP any bump that moves no exported derivation, push. --downstream requests rke2lab's own relock — impl: nix-flake-commons lib.mkRelockApp";
+      };
 
       formatter = pkgs.alejandra;
     });
