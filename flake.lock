@@ -58,9 +58,6 @@
         "nvfetcher": [
           "nixpkgs"
         ],
-        "socket-vmnet": [
-          "nixpkgs"
-        ],
         "sops-nix": [
           "nixpkgs"
         ],
@@ -69,11 +66,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1791375952,
-        "narHash": "sha256-iPat/fHlm1M/co4wVfAcGMANBYYdyGdGmMtRkHtOTUQ=",
+        "lastModified": 1791380945,
+        "narHash": "sha256-x6FHfbEu8JsB8cWajr0Qo96mpNHW15jE57SlMpoZXsU=",
         "owner": "seedmatic",
         "repo": "nix-flake-commons",
-        "rev": "12788923b2a09af5a0b4b890bd1358278757ebe9",
+        "rev": "85e86f59b0e4092f6c4e4d63f7c04dc628169744",
         "type": "github"
       },
       "original": {
