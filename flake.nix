@@ -144,20 +144,18 @@
         # flox-nri-hooks is Linux-only (util-linux); don't expose it on darwin.
         // lib.optionalAttrs pkgs.stdenv.isLinux {inherit flox-nri-hooks;};
 
-      # relock — THIS repo's locks, by the shared implementation in nix-flake-commons'
-      # `lib.mkRelockApp`. `consumers` names rke2lab, which pins this repo as its `flox-runtime` input.
+      # relock — nix-flake-commons' `lib.mkRelockApp`, the one implementation every seedmatic
+      # flake shares. This head supplies its name; the heads, the order and what each head pins
+      # are read from nix-flake-commons:fabric/heads.
       apps.relock = {
         type = "app";
         program = "${
           inputs.flake-commons.lib.mkRelockApp {
             inherit pkgs;
-            name = "flox-nri-plugin";
-            slug = "seedmatic/flox-nri-plugin";
-            url = "https://github.com/seedmatic/flox-nri-plugin.git";
-            consumers = ["github:seedmatic/rke2lab"];
+            name = "flox-runtime";
           }
         }/bin/relock";
-        meta.description = "Reconcile THIS repo's locks: bump each input, DROP any bump that moves no exported derivation, push. --downstream requests rke2lab's own relock — impl: nix-flake-commons lib.mkRelockApp";
+        meta.description = "Reconcile THIS head's locks: bump each input, DROP any bump that moves nothing it exports, push. --plan shows a pass, --downstream plays it over every head of fabric/heads";
       };
 
       formatter = pkgs.alejandra;
