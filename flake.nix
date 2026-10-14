@@ -35,7 +35,6 @@
     # their whole closures into our lock (~8.5 MB). We never evaluate flake-commons'
     # outputs, so redirect every unused input to `nixpkgs` — this collapses their
     # subtrees out of the lock. Keep this list in sync if the aggregator grows.
-    flake-commons.inputs.bird.follows = "nixpkgs";
     flake-commons.inputs.chromium-bin.follows = "nixpkgs";
     flake-commons.inputs.darwin.follows = "nixpkgs";
     flake-commons.inputs.determinate.follows = "nixpkgs";
