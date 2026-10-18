@@ -1,22 +1,6 @@
 {
   description = "Flox containerd NRI plugin (fork) — injects flox (nix-built) environments into Kubernetes pods via a store-resolved overlay";
 
-  # Public flake: consumers outside the fleet lack ndh's system-wide cache-trust, so declare the
-  # non-default binary caches this flake's closure resolves from. ADDITIVE (extra-*) + public-read,
-  # honoured via --accept-flake-config — an external clone or CI substitutes instead of rebuilding.
-  #   - nxmatic.cachix.org : where our build of the plugin is published (substituted, not rebuilt).
-  #   - cache.flox.dev     : this flake builds against flake-commons' nixpkgs and lives in the flox
-  #                          ecosystem (its closure pulls flox/nixpkgs fork nodes), whose store paths
-  #                          are on flox's cache rather than cache.nixos.org.
-  nixConfig.extra-substituters = [
-    "https://cache.flox.dev"
-    "https://nxmatic.cachix.org"
-  ];
-  nixConfig.extra-trusted-public-keys = [
-    "flox-cache-public-1:7F4OyH7ZCnFhcze3fJdfyXYLQw/aV7GEed86nQ7IsOs="
-    "nxmatic.cachix.org-1:huMghYiwDpPa1PMXHXK4G1Dp4QOZjgsNqxcjf/AjuJ0="
-  ];
-
   # Every SEEDMATIC-owned input below is an INDIRECT id (`url = "flake-commons"`), resolved through
   # nix's registry: the branch-less default target lives in the committed flake-registry.json, and
   # the operator re-aims it by dropping a flake-registry.local.json beside it (see the [include] in
@@ -135,6 +119,8 @@
         done
       '';
     in {
+      # No nixConfig in this flake: no machine of ours takes one (nix-flake-commons' shared check).
+      checks.no-nix-config = inputs.flake-commons.lib.noNixConfig pkgs ./flake.nix;
       packages =
         {
           inherit flox-nri-plugin flox-nri-plugin-debug;
